@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::compiler::compile_modules_in_file;
+use log::LevelFilter;
 use move_binary_format::CompiledModule;
+use move_core_types::gas_schedule::{GasAlgebra, GasUnits};
 use move_core_types::{
     account_address::AccountAddress,
     identifier::{IdentStr, Identifier},
@@ -10,7 +12,8 @@ use move_core_types::{
 };
 use move_vm_runtime::move_vm::MoveVM;
 use move_vm_test_utils::InMemoryStorage;
-use move_vm_types::gas_schedule::GasStatus;
+use move_vm_types::gas_schedule::{GasStatus, INITIAL_COST_SCHEDULE};
+use std::ops::Deref;
 use std::{path::PathBuf, sync::Arc, thread};
 
 const WORKING_ACCOUNT: AccountAddress =
@@ -100,7 +103,9 @@ impl Adapter {
     }
 
     fn call_function(&self, module: &ModuleId, name: &IdentStr) {
-        let mut gas_status = GasStatus::new_unmetered();
+        let mut gas_table = INITIAL_COST_SCHEDULE.deref().clone();
+        gas_table.gas_constants.gas_unit_scaling_factor = 1;
+        let mut gas_status = GasStatus::new(&gas_table, GasUnits::new(100000000));
         let mut session = self.vm.new_session(&self.store);
         session
             .execute_function(module, name, vec![], vec![], &mut gas_status)
@@ -122,6 +127,25 @@ fn load() {
     adapter.publish_modules(modules);
     // calls all functions sequentially
     adapter.call_functions();
+}
+
+#[test]
+fn test_trace() {
+    env_logger::builder()
+        .filter_level(LevelFilter::Trace)
+        .init();
+    let data_store = InMemoryStorage::new();
+    let mut adapter = Adapter::new(data_store);
+    let modules = get_modules();
+    adapter.publish_modules(modules);
+    // calls all functions sequentially
+    adapter.call_function(
+        &ModuleId::new(
+            AccountAddress::from_hex_literal("0x02").unwrap(),
+            Identifier::new("F").unwrap(),
+        ),
+        Identifier::new("entry_f").unwrap().as_ident_str(),
+    );
 }
 
 #[test]

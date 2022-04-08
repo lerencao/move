@@ -1,6 +1,7 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::gas_layer::GasLayer;
 use crate::{
     loader::{Function, Loader, Resolver},
     native_functions::NativeContext,
@@ -27,7 +28,9 @@ use move_vm_types::{
     },
 };
 use std::{cmp::min, collections::VecDeque, fmt::Write, mem, sync::Arc};
-use tracing::error;
+use tracing::span::EnteredSpan;
+use tracing::{error, Dispatch};
+use tracing_subscriber::layer::SubscriberExt;
 
 macro_rules! debug_write {
     ($($toks: tt)*) => {
@@ -63,6 +66,7 @@ pub(crate) struct Interpreter {
     operand_stack: Stack,
     /// The stack of active functions.
     call_stack: CallStack,
+    tracing: Vec<EnteredSpan>,
 }
 
 impl Interpreter {
@@ -88,6 +92,7 @@ impl Interpreter {
         Interpreter {
             operand_stack: Stack::new(),
             call_stack: CallStack::new(),
+            tracing: Vec::new(),
         }
     }
 
@@ -123,14 +128,51 @@ impl Interpreter {
         ty_args: Vec<Type>,
         args: Vec<Value>,
     ) -> VMResult<Vec<Value>> {
+        // let dispatcher = tracing::dispatcher::Dispatch::new(NoSubscriber::default());
+        // tracing_subscriber::Registry::default().with(GasLayer::new());
+        //let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+
+        let (gas_layer, _guard) =
+            GasLayer::with_file("./tracing.folded", gas_status.remaining_gas().get()).unwrap();
+        let subscriber = tracing_subscriber::Registry::default()
+            .with(tracing_subscriber::fmt::Layer::default())
+            .with(gas_layer);
+        let dispatcher = Dispatch::new(subscriber);
+
+        let root_span = tracing::dispatcher::with_default(&dispatcher, || {
+            let module_id = function.module_id();
+            let function_name = function.name().to_ascii_lowercase();
+            match module_id {
+                Some(m) => {
+                    let module_address = m.address().to_string();
+                    let module_name = m.name().to_string();
+                    tracing::trace_span!(
+                        "root",
+                        function_name = function_name.as_str(),
+                        module_address = module_address.as_str(),
+                        module_name = module_name.as_str()
+                    )
+                    .entered()
+                }
+                None => {
+                    tracing::trace_span!("root", function_name = function_name.as_str()).entered()
+                }
+            }
+        });
+
         let mut locals = Locals::new(function.local_count());
         for (i, value) in args.into_iter().enumerate() {
             locals
                 .store_loc(i, value)
                 .map_err(|e| self.set_location(e))?;
         }
-
+        let mut current_span = root_span;
         let mut current_frame = Frame::new(function, ty_args, locals);
+        tracing::dispatcher::with_default(
+            &dispatcher,
+            || tracing::trace!(target: "start", parent: current_span.id(), remaining_gas=gas_status.remaining_gas().get()),
+        );
+
         loop {
             let resolver = current_frame.resolver(loader);
             let exit_code = current_frame //self
@@ -141,15 +183,53 @@ impl Interpreter {
                     if let Some(frame) = self.call_stack.pop() {
                         current_frame = frame;
                         current_frame.pc += 1; // advance past the Call instruction in the caller
+                        if let Some(span) = self.tracing.pop() {
+                            tracing::dispatcher::with_default(
+                                &dispatcher,
+                                || tracing::trace!(target: "end", parent: current_span.id(), remaining_gas = gas_status.remaining_gas().get()),
+                            );
+                            current_span = span;
+                        } else {
+                            unreachable!()
+                        }
                     } else {
+                        tracing::dispatcher::with_default(
+                            &dispatcher,
+                            || tracing::trace!(target: "end", parent: current_span.id(), remaining_gas = gas_status.remaining_gas().get()),
+                        );
                         return Ok(mem::take(&mut self.operand_stack.0));
                     }
                 }
                 ExitCode::Call(fh_idx) => {
+                    let func = resolver.function_from_handle(fh_idx);
+
+                    {
+                        let function_name = func.name();
+                        let module_id = func.module_id().unwrap();
+                        let module_address = module_id.address().to_string();
+                        let module_name = module_id.name().to_string();
+
+                        let span = tracing::dispatcher::with_default(&dispatcher, || {
+                            tracing::trace_span!(
+                                parent: &current_span,
+                                "call",
+                                function_name = function_name,
+                                module_address = module_address.as_str(),
+                                module_name = module_name.as_str()
+                            )
+                            .entered()
+                        });
+                        self.tracing.push(current_span);
+                        current_span = span;
+                        tracing::dispatcher::with_default(
+                            &dispatcher,
+                            || tracing::trace!(target: "start", parent: current_span.id(), remaining_gas=gas_status.remaining_gas().get()),
+                        );
+                    }
+
                     gas_status
                         .charge_instr_with_size(Opcodes::CALL, AbstractMemorySize::new(1))
                         .map_err(|e| set_err_info!(current_frame, e))?;
-                    let func = resolver.function_from_handle(fh_idx);
                     gas_status
                         .charge_instr_with_size(
                             Opcodes::CALL,
@@ -159,6 +239,15 @@ impl Interpreter {
                     if func.is_native() {
                         self.call_native(&resolver, data_store, gas_status, func, vec![])?;
                         current_frame.pc += 1; // advance past the Call instruction in the caller
+                        if let Some(span) = self.tracing.pop() {
+                            tracing::dispatcher::with_default(
+                                &dispatcher,
+                                || tracing::trace!(target: "end", parent: current_span.id(), remaining_gas = gas_status.remaining_gas().get()),
+                            );
+                            current_span = span;
+                        } else {
+                            unreachable!()
+                        }
                         continue;
                     }
                     let frame = self
@@ -172,6 +261,31 @@ impl Interpreter {
                     current_frame = frame;
                 }
                 ExitCode::CallGeneric(idx) => {
+                    let func = resolver.function_from_instantiation(idx);
+
+                    {
+                        let function_name = func.name();
+                        let module_id = func.module_id().unwrap();
+                        let module_address = module_id.address().to_string();
+                        let module_name = module_id.name().to_string();
+
+                        let span = tracing::dispatcher::with_default(&dispatcher, || {
+                            tracing::trace_span!(
+                                parent: current_span.id(),
+                                "call_generic",
+                                function_name = function_name,
+                                module_address = module_address.as_str(),
+                                module_name = module_name.as_str()
+                            )
+                            .entered()
+                        });
+                        self.tracing.push(current_span);
+                        current_span = span;
+                        tracing::dispatcher::with_default(
+                            &dispatcher,
+                            || tracing::trace!(target: "start", parent: current_span.id(), remaining_gas=gas_status.remaining_gas().get()),
+                        );
+                    }
                     let arity = resolver.type_params_count(idx);
                     gas_status
                         .charge_instr_with_size(
@@ -182,7 +296,6 @@ impl Interpreter {
                     let ty_args = resolver
                         .instantiate_generic_function(idx, current_frame.ty_args())
                         .map_err(|e| set_err_info!(current_frame, e))?;
-                    let func = resolver.function_from_instantiation(idx);
                     gas_status
                         .charge_instr_with_size(
                             Opcodes::CALL_GENERIC,
@@ -192,6 +305,15 @@ impl Interpreter {
                     if func.is_native() {
                         self.call_native(&resolver, data_store, gas_status, func, ty_args)?;
                         current_frame.pc += 1; // advance past the Call instruction in the caller
+                        if let Some(span) = self.tracing.pop() {
+                            tracing::dispatcher::with_default(
+                                &dispatcher,
+                                || tracing::trace!(target: "end", parent: current_span.id(), remaining_gas = gas_status.remaining_gas().get()),
+                            );
+                            current_span = span;
+                        } else {
+                            unreachable!()
+                        }
                         continue;
                     }
                     let frame = self

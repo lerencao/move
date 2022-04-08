@@ -31,3 +31,4 @@ mod debug;
 mod unit_tests;
 
 pub mod move_vm_adapter;
+pub(crate) mod gas_layer;
