@@ -191,9 +191,10 @@ impl ResolvingGraph {
             // Different packages, with same name: Not OK
             Some(other) => {
                 bail!(
-                    "Conflicting dependencies found: package '{}' conflicts with '{}'",
-                    other.source_package.package.name,
-                    package.package.name,
+                    "Conflicting dependencies found: package '{:?}' conflicts with '{:?}' in {}",
+                    other.source_package,
+                    package,
+                    &self.root_package.package.name
                 )
             }
         };
