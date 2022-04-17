@@ -30,5 +30,6 @@ mod debug;
 #[cfg(test)]
 mod unit_tests;
 
+///pub(crate) mod gas_layer;
 pub mod move_vm_adapter;
-pub(crate) mod gas_layer;
+pub(crate) mod tracer;
